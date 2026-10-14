@@ -362,9 +362,11 @@ fn plot_group(w: &mut W, c: &Chart, kind: ChartType, list: &[(usize, &Series)]) 
     w.close(tag);
 }
 
-/// The chart part XML.
-pub fn chart_xml(c: &Chart) -> Vec<u8> {
-    // Reuse the kept part when the chart is unchanged since it was read.
+/// The chart part XML; `o` is the chart part, given the relationships the XML refers to.
+pub fn chart_xml(x: &mut super::Exp, o: &mut super::Out, c: &Chart) -> Vec<u8> {
+    // Reuse the kept part when the chart is unchanged since it was read: its embedded workbook
+    // and user shapes come along. An edited chart is written from the model, and the workbook
+    // (now holding other data) is left out.
     if let Some(raw) = &c.raw
         && let Ok(doc) = crate::xml::parse(raw.as_bytes())
         && doc.root.is("chartSpace")
@@ -374,12 +376,26 @@ pub fn chart_xml(c: &Chart) -> Vec<u8> {
         if let Some(back) = crate::read::chart_from_el(&root) {
             let mut me = c.clone();
             me.raw = None;
+            me.kept_rels = vec![];
+            let mut back = back;
+            back.kept_rels = vec![];
             if back == me {
                 let mut keep = doc.root;
-                keep.remove_all(&["externalData", "userShapes"]);
-                let mut w = W::new();
-                w.raw(&keep.to_xml());
-                return w.finish();
+                let mut map = std::collections::HashMap::new();
+                for r in c.kept_rels.iter().take(1000) {
+                    if let Some(id) = x.kept_rel(o, r) {
+                        map.insert(r.id.clone(), id);
+                    }
+                }
+                let kept = |e: &crate::xml::El| e.attr("r:id").is_none_or(|id| map.contains_key(id));
+                keep.children.retain(|n| !matches!(n, crate::xml::Node::El(e) if matches!(e.local(), "externalData" | "userShapes") && !kept(e)));
+                if !super::remap_rel_refs(&mut keep, &map) {
+                    log::warn!("pptx: a chart's relationship target is missing; the chart is written from the model");
+                } else {
+                    let mut w = W::new();
+                    w.raw(&keep.to_xml());
+                    return w.finish();
+                }
             }
         }
     }

@@ -1,5 +1,6 @@
 //! The native `.deckcraft` format: a zip holding `presentation.json` (the model, minus media
-//! bytes), `media/<id>` files with the embedded media, and `mimetype`. Readers ignore unknown
+//! bytes), `media/<id>` files with the embedded media, `kept/<index>` files with the bytes of
+//! parts kept from an opened file, and `mimetype`. Readers ignore unknown
 //! fields, so newer files open in older builds with what those builds understand.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
@@ -67,6 +68,12 @@ pub fn save(p: &Presentation) -> Result<Vec<u8>> {
             z.start_file(format!("media/{}", item.id.0), opts).map_err(w)?;
             z.write_all(&item.data).map_err(|e| FormatError::Write(e.to_string()))?;
         }
+        // Parts kept from an opened file, by their index in `kept_parts`.
+        for (i, part) in p.kept_parts.iter().enumerate() {
+            let opts = if is_compressed(&part.content_type) { stored } else { deflate };
+            z.start_file(format!("kept/{i}"), opts).map_err(w)?;
+            z.write_all(&part.data).map_err(|e| FormatError::Write(e.to_string()))?;
+        }
         z.finish().map_err(w)?;
     }
     Ok(buf.into_inner())
@@ -110,6 +117,13 @@ pub fn load(bytes: &[u8]) -> Result<Presentation> {
             item.data = Arc::new(data);
         }
     }
+    for (i, part) in p.kept_parts.iter_mut().enumerate() {
+        if let Ok(data) = read_entry(&mut z, &format!("kept/{i}")) {
+            part.data = Arc::new(data);
+        }
+    }
+    // A kept part without bytes (a manifest written by an older version) cannot be written back.
+    p.kept_parts.retain(|k| !k.data.is_empty());
     repair(&mut p);
     Ok(p)
 }
@@ -217,6 +231,22 @@ pub fn slides_to_outline(p: &Presentation) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kept_parts_keep_their_bytes() {
+        use deckcraft_model::{KeptPart, KeptRel, KeptTarget};
+        let mut p = defaults::new_presentation(None);
+        p.kept_parts.push(KeptPart {
+            name: "ppt/printerSettings/printerSettings1.bin".into(),
+            content_type: "application/vnd.openxmlformats-officedocument.presentationml.printerSettings".into(),
+            data: Arc::new(vec![7; 40]),
+            rels: vec![KeptRel { id: "rId1".into(), kind: "x".into(), target: KeptTarget::External { url: "https://example.org".into() } }],
+        });
+        let q = load(&save(&p).expect("save")).expect("load");
+        assert_eq!(q.kept_parts.len(), 1);
+        assert_eq!(q.kept_parts[0].data.as_slice(), &[7u8; 40][..]);
+        assert_eq!(q.kept_parts[0].rels, p.kept_parts[0].rels);
+    }
 
     #[test]
     fn roundtrip_with_media() {

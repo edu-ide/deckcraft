@@ -14,8 +14,8 @@ use std::sync::Arc;
 use deckcraft_geom::{Size, emu_to_pt};
 use deckcraft_model::text::TextBody;
 use deckcraft_model::{
-    Background, Comment, CustomShow, Geom, HeaderFooter, Layout, LayoutId, LayoutType, Master, MasterId, MediaId, MediaItem, PhType, Presentation,
-    Properties, Section, ShowSettings, Slide, SlideId, defaults,
+    Background, Comment, CustomShow, Geom, HeaderFooter, KeptPart, KeptRel, KeptTarget, Layout, LayoutId, LayoutType, Master, MasterId, MediaId,
+    MediaItem, PhType, Presentation, Properties, Section, ShapeKind, ShowSettings, Slide, SlideId, defaults,
 };
 
 use crate::PptxError;
@@ -81,6 +81,55 @@ impl Part {
     pub fn keep(&self, el: &El) -> String {
         keep_xml(el, &self.ns)
     }
+}
+
+/// Every relationship of a part as a kept relationship. Internal ones point at parts for now;
+/// `collect_kept` retargets them once the import knows what it consumed, dropping those whose
+/// target the export regenerates.
+pub fn kept_rels(rels: &Rels) -> Vec<KeptRel> {
+    rels.items
+        .iter()
+        .take(10_000)
+        .map(|r| KeptRel {
+            id: r.id.clone(),
+            kind: r.ty.clone(),
+            target: if r.external { KeptTarget::External { url: r.target.clone() } } else { KeptTarget::Part { name: r.target.clone() } },
+        })
+        .collect()
+}
+
+/// The relationships an element refers to (`r:id`, `r:embed`…), external ones included.
+pub fn referenced_rels(el: &El, rels: &Rels) -> Vec<KeptRel> {
+    let mut ids = vec![];
+    fn rec(e: &El, ids: &mut Vec<String>, depth: usize) {
+        if depth > crate::xml::MAX_DEPTH {
+            return;
+        }
+        for (k, v) in &e.attrs {
+            if is_rel_attr(k) && !v.is_empty() && !ids.iter().any(|i| i == v) {
+                ids.push(v.clone());
+            }
+        }
+        for c in e.elements() {
+            rec(c, ids, depth + 1);
+        }
+    }
+    rec(el, &mut ids, 0);
+    ids.iter()
+        .filter_map(|id| rels.get(id))
+        .map(|r| KeptRel {
+            id: r.id.clone(),
+            kind: r.ty.clone(),
+            target: if r.external { KeptTarget::External { url: r.target.clone() } } else { KeptTarget::Part { name: r.target.clone() } },
+        })
+        .collect()
+}
+
+/// Is this attribute a relationship reference (`r:id`, `r:embed`, `r:link`, `r:dm`…)?
+pub fn is_rel_attr(key: &str) -> bool {
+    !key.starts_with("xmlns")
+        && key.contains(':')
+        && matches!(key.rsplit(':').next(), Some("id" | "embed" | "link" | "dm" | "lo" | "qs" | "cs" | "pict" | "href"))
 }
 
 /// Serialize `el`, declaring every prefix it uses that the source root declared.
@@ -305,6 +354,7 @@ pub fn import(bytes: &[u8]) -> Result<Presentation, PptxError> {
         let part = Part::new(&pkg, path, doc);
         let layout = part.rels.first_of("slideLayout").and_then(|r| layout_by_part.get(&opc::norm(&r.target)).copied()).unwrap_or(fallback_layout);
         let mut slide = read_slide(&mut imp, &part, doc, *id, layout);
+        slide.kept_rels = kept_rels(&part.rels);
         // Notes.
         if let Some(n) = part.rels.first_of("notesSlide")
             && let Some(nd) = load(&pkg, &n.target)
@@ -399,10 +449,81 @@ pub fn import(bytes: &[u8]) -> Result<Presentation, PptxError> {
 
     inherit_placeholder_geometry(&mut p);
     p.header_footer = header_footer(&p);
+    p.kept_package_rels = kept_rels(&root_rels);
+    p.kept_rels = kept_rels(&pres_part.rels);
+    collect_kept(&imp, &mut p);
     p.media = std::mem::take(&mut imp.media);
     p.next_id = imp.next;
     p.fix_next_id();
     Ok(p)
+}
+
+/// Keep every part the model did not consume, and point every kept relationship at what the
+/// export will write: a kept part, a media item, a slide, or nothing (consumed and regenerated).
+fn collect_kept(imp: &Imp, p: &mut Presentation) {
+    let pkg = imp.pkg;
+    let mut kept: Vec<KeptPart> = pkg
+        .parts()
+        .filter(|(name, _)| {
+            let n = opc::norm(name);
+            !pkg.is_consumed(&n) && !n.ends_with(".rels") && n != "[content_types].xml" && !opc::regenerated(name)
+        })
+        .map(|(name, data)| KeptPart {
+            name: name.to_string(),
+            content_type: pkg.content_type(name).filter(|c| !c.is_empty()).unwrap_or_else(|| crate::mime_for(name).to_string()),
+            data: Arc::new(data.to_vec()),
+            rels: kept_rels(&pkg.rels(name)),
+        })
+        .collect();
+    kept.sort_by(|a, b| a.name.cmp(&b.name));
+    let names: HashMap<String, String> = kept.iter().map(|k| (opc::norm(&k.name), k.name.clone())).collect();
+    let resolve = |r: &mut KeptRel| -> bool {
+        let KeptTarget::Part { name } = &r.target else { return true };
+        let key = opc::norm(name);
+        if let Some(m) = imp.media_by_part.get(&key) {
+            r.target = KeptTarget::Media { id: *m };
+        } else if let Some(s) = imp.slide_by_part.get(&key) {
+            r.target = KeptTarget::Slide { id: *s };
+        } else if let Some(n) = names.get(&key) {
+            r.target = KeptTarget::Part { name: n.clone() };
+        } else {
+            return false;
+        }
+        true
+    };
+    for k in &mut kept {
+        k.rels.retain_mut(&resolve);
+    }
+    p.kept_parts = kept;
+    // Parts the export regenerates only need the relationships to kept parts; those to media
+    // and slides are written from the model.
+    let to_kept = |r: &mut KeptRel| resolve(r) && matches!(r.target, KeptTarget::Part { .. });
+    p.kept_package_rels.retain_mut(to_kept);
+    p.kept_rels.retain_mut(to_kept);
+    let shapes = |list: &mut [deckcraft_model::Shape]| {
+        walk_shapes_mut(list, &mut |s| match &mut s.kind {
+            ShapeKind::Opaque { rels, .. } => rels.retain_mut(&resolve),
+            ShapeKind::Chart(c) => c.kept_rels.retain_mut(&resolve),
+            _ => {}
+        });
+    };
+    for sl in &mut p.slides {
+        let sl = Arc::make_mut(sl);
+        sl.kept_rels.retain_mut(to_kept);
+        shapes(&mut sl.shapes);
+    }
+    for m in &mut p.masters {
+        let m = Arc::make_mut(m);
+        m.kept_rels.retain_mut(to_kept);
+        shapes(&mut m.shapes);
+        for l in &mut m.layouts {
+            l.kept_rels.retain_mut(to_kept);
+            shapes(&mut l.shapes);
+        }
+    }
+    if let Some(nm) = &mut p.notes_master {
+        shapes(&mut Arc::make_mut(nm).shapes);
+    }
 }
 
 fn sane_len(v: f64, dflt: f64) -> f64 {
@@ -415,12 +536,7 @@ pub fn has_rel_refs(el: &El) -> bool {
         if depth > crate::xml::MAX_DEPTH {
             return false;
         }
-        let own = e.attrs.iter().any(|(k, v)| {
-            !k.starts_with("xmlns")
-                && k.contains(':')
-                && matches!(k.rsplit(':').next(), Some("id" | "embed" | "link" | "dm" | "lo" | "qs" | "cs" | "pict" | "href"))
-                && !v.is_empty()
-        });
+        let own = e.attrs.iter().any(|(k, v)| is_rel_attr(k) && !v.is_empty());
         own || e.elements().any(|c| rec(c, depth + 1))
     }
     rec(el, 0)
@@ -594,7 +710,7 @@ fn read_master(imp: &mut Imp, path: &str, doc: &Doc, docs: &HashMap<String, Doc>
     let pkg = imp.pkg;
     let part = Part::new(pkg, path, doc);
     let root = &doc.root;
-    let mut m = Master { id: MasterId(0), preserve: root.bool("preserve").unwrap_or(false), ..Default::default() };
+    let mut m = Master { id: MasterId(0), preserve: root.bool("preserve").unwrap_or(false), kept_rels: kept_rels(&part.rels), ..Default::default() };
     if let Some(t) = part.rels.first_of("theme")
         && let Some(td) = pkg.xml(&t.target)
     {
@@ -644,7 +760,8 @@ fn read_master(imp: &mut Imp, path: &str, doc: &Doc, docs: &HashMap<String, Doc>
         }
         let Some(ld) = docs.get(&key) else { continue };
         let lpart = Part::new(pkg, lp, ld);
-        let l = read_layout(imp, &lpart, ld);
+        let mut l = read_layout(imp, &lpart, ld);
+        l.kept_rels = kept_rels(&lpart.rels);
         layout_by_part.insert(key, l.id);
         m.layouts.push(l);
     }

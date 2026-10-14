@@ -288,6 +288,9 @@ pub enum ShapeKind {
         xml: String,
         preview: Option<MediaId>,
         label: String,
+        /// The relationships the XML refers to (`r:id`, `r:embed`…), by their ids in the XML.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        rels: Vec<KeptRel>,
     },
 }
 
@@ -537,6 +540,9 @@ pub struct Slide {
     /// Unmodelled XML kept for round-trip (custom data, tags).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_ext: Option<String>,
+    /// Relationships of the slide part to kept parts.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub kept_rels: Vec<KeptRel>,
 }
 
 impl Default for Slide {
@@ -555,6 +561,7 @@ impl Default for Slide {
             comments: vec![],
             color_map: None,
             raw_ext: None,
+            kept_rels: vec![],
         }
     }
 }
@@ -649,6 +656,9 @@ pub struct Layout {
     pub color_map: Option<Vec<(String, String)>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_ext: Option<String>,
+    /// Relationships of the part to kept parts.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub kept_rels: Vec<KeptRel>,
 }
 
 /// Which placeholders slides show in the footer row (Header & Footer dialog).
@@ -684,6 +694,9 @@ pub struct Master {
     pub preserve: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_ext: Option<String>,
+    /// Relationships of the part to kept parts.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub kept_rels: Vec<KeptRel>,
 }
 
 impl Master {
@@ -817,6 +830,53 @@ pub struct MediaItem {
     pub link: Option<String>,
 }
 
+/// A package part the model does not interpret (printer settings, embedded workbooks, OLE
+/// objects, thumbnails…), kept byte-for-byte so that saving a file does not drop it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct KeptPart {
+    /// Part name as the file spelled it, without a leading slash (`ppt/embeddings/oleObject1.bin`).
+    pub name: String,
+    pub content_type: String,
+    /// Bytes; kept out of the JSON manifest and stored as a separate file in native files.
+    #[serde(skip)]
+    pub data: Arc<Vec<u8>>,
+    /// The part's own relationships, with the ids its content refers to.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub rels: Vec<KeptRel>,
+}
+
+/// A relationship from a part the file writer regenerates (or a kept part) to something kept.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct KeptRel {
+    /// Relationship id as the source part referred to it (`rId3`).
+    pub id: String,
+    /// Full relationship type URI.
+    pub kind: String,
+    pub target: KeptTarget,
+}
+
+/// What a kept relationship points at.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "type")]
+pub enum KeptTarget {
+    /// A kept part, by its name.
+    Part { name: String },
+    /// A media item of the deck (written once, however many parts refer to it).
+    Media { id: MediaId },
+    /// A slide of the deck.
+    Slide { id: SlideId },
+    /// An external URL.
+    External { url: String },
+}
+
+impl Default for KeptTarget {
+    fn default() -> Self {
+        KeptTarget::External { url: String::new() }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Presentation {
@@ -846,6 +906,15 @@ pub struct Presentation {
     /// Unmodelled presentation-level XML kept for round-trip.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_ext: Option<String>,
+    /// Parts of the opened file the model does not interpret, written back as they were.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kept_parts: Vec<KeptPart>,
+    /// Package-level relationships (`_rels/.rels`) to kept parts: the thumbnail…
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kept_package_rels: Vec<KeptRel>,
+    /// Presentation-part relationships to kept parts: printer settings, VBA project…
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kept_rels: Vec<KeptRel>,
 }
 
 impl Default for Presentation {

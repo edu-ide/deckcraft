@@ -485,6 +485,7 @@ fn insert_layout(s: &mut Session, p: &Value) -> Result<Value> {
                 preserve: true,
                 color_map: None,
                 raw_ext: None,
+                kept_rels: vec![],
             },
         );
         sel.target = Target::Layout { master: mi, layout: at.min(m.layouts.len().saturating_sub(1)) };

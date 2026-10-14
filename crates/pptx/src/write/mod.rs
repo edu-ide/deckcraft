@@ -12,7 +12,8 @@ use std::sync::Arc;
 use deckcraft_geom::Xfrm;
 use deckcraft_model::text::{Paragraph, TextBody};
 use deckcraft_model::{
-    Background, Comment, Layout, LayoutId, Master, MediaId, PhType, Placeholder, Presentation, Shape, ShapeId, Slide, SlideId, defaults,
+    Background, Comment, KeptRel, KeptTarget, Layout, LayoutId, Master, MediaId, PhType, Placeholder, Presentation, Shape, ShapeId, Slide, SlideId,
+    defaults,
 };
 
 use crate::PptxError;
@@ -46,6 +47,8 @@ pub struct Exp<'a> {
     pub slide_parts: HashMap<SlideId, String>,
     pub table_styles: Vec<String>,
     placeholder: Option<String>,
+    /// Kept parts that will be written, by normalised name → name as written.
+    kept_names: HashMap<String, String>,
 }
 
 /// A part being written: its name and relationships.
@@ -115,12 +118,17 @@ impl Exp<'_> {
         } else {
             m.content_type.clone()
         };
-        let name = if ct.starts_with("image/") {
-            self.n_image += 1;
-            format!("ppt/media/image{}.{ext}", self.n_image)
-        } else {
-            self.n_media += 1;
-            format!("ppt/media/media{}.{ext}", self.n_media)
+        let name = loop {
+            let name = if ct.starts_with("image/") {
+                self.n_image += 1;
+                format!("ppt/media/image{}.{ext}", self.n_image)
+            } else {
+                self.n_media += 1;
+                format!("ppt/media/media{}.{ext}", self.n_media)
+            };
+            if !self.pkg.taken(&name) {
+                break name;
+            }
         };
         self.pkg.binary(&name, &ct, m.data.as_ref().clone());
         self.media_parts.insert(id, name.clone());
@@ -149,8 +157,13 @@ impl Exp<'_> {
         let part = match &self.placeholder {
             Some(p) => p.clone(),
             None => {
-                self.n_image += 1;
-                let name = format!("ppt/media/image{}.png", self.n_image);
+                let name = loop {
+                    self.n_image += 1;
+                    let name = format!("ppt/media/image{}.png", self.n_image);
+                    if !self.pkg.taken(&name) {
+                        break name;
+                    }
+                };
                 self.pkg.binary(&name, "image/png", crate::png::transparent_1x1());
                 self.placeholder = Some(name.clone());
                 name
@@ -159,11 +172,67 @@ impl Exp<'_> {
         o.rels.add("image", &opc::relative(&o.name, &part), false)
     }
     pub fn chart_rel(&mut self, o: &mut Out, c: &deckcraft_model::Chart) -> String {
-        self.n_chart += 1;
-        let name = format!("ppt/charts/chart{}.xml", self.n_chart);
-        self.pkg.xml_part(&name, CT_CHART, chart::chart_xml(c));
+        let name = loop {
+            self.n_chart += 1;
+            let name = format!("ppt/charts/chart{}.xml", self.n_chart);
+            if !self.pkg.taken(&name) {
+                break name;
+            }
+        };
+        let mut co = Out::new(&name);
+        let xml = chart::chart_xml(self, &mut co, c);
+        self.pkg.xml_part(&name, CT_CHART, xml);
+        self.pkg.rels(&name, &co.rels);
         o.rels.add_new("chart", &opc::relative(&o.name, &name), false)
     }
+    /// The part a kept relationship points at, as this export writes it.
+    fn kept_target(&mut self, t: &KeptTarget) -> Option<String> {
+        match t {
+            KeptTarget::Part { name } => self.kept_names.get(&opc::norm(name)).cloned(),
+            KeptTarget::Media { id } => self.media_part(*id),
+            KeptTarget::Slide { id } => self.slide_parts.get(id).cloned(),
+            KeptTarget::External { .. } => None,
+        }
+    }
+    /// Restore a kept relationship from `o`; the id it got, or `None` when its target is gone.
+    pub fn kept_rel(&mut self, o: &mut Out, r: &KeptRel) -> Option<String> {
+        if let KeptTarget::External { url } = &r.target {
+            return Some(o.rels.add(&r.kind, url, true));
+        }
+        let part = self.kept_target(&r.target)?;
+        Some(o.rels.add(&r.kind, &opc::relative(&o.name, &part), false))
+    }
+    /// Restore a kept part's own relationships under the ids its content refers to.
+    fn kept_part_rels(&mut self, o: &mut Out, rels: &[KeptRel]) {
+        for r in rels {
+            if let KeptTarget::External { url } = &r.target {
+                o.rels.push(&r.id, &r.kind, url, true);
+            } else if let Some(part) = self.kept_target(&r.target) {
+                o.rels.push(&r.id, &r.kind, &opc::relative(&o.name, &part), false);
+            } else {
+                log::warn!("pptx: kept part {} loses its relationship {} (target no longer exists)", o.name, r.id);
+            }
+        }
+    }
+}
+
+/// Rewrite every relationship reference in `el` through `map`; `false` when one is unknown.
+pub fn remap_rel_refs(el: &mut crate::xml::El, map: &HashMap<String, String>) -> bool {
+    fn rec(e: &mut crate::xml::El, map: &HashMap<String, String>, depth: usize) -> bool {
+        if depth > crate::xml::MAX_DEPTH {
+            return false;
+        }
+        for (k, v) in &mut e.attrs {
+            if crate::read::is_rel_attr(k) && !v.is_empty() {
+                match map.get(v.as_str()) {
+                    Some(n) => *v = n.clone(),
+                    None => return false,
+                }
+            }
+        }
+        e.elements_mut().all(|c| rec(c, map, depth + 1))
+    }
+    rec(el, map, 0)
 }
 
 fn root_open(w: &mut W, tag: &str, extra: A) {
@@ -388,9 +457,20 @@ pub fn export(p: &Presentation) -> Result<Vec<u8>, PptxError> {
         slide_parts: HashMap::new(),
         table_styles: vec![],
         placeholder: None,
+        kept_names: HashMap::new(),
     };
     for (i, s) in p.slides.iter().enumerate() {
         x.slide_parts.insert(s.id, format!("ppt/slides/slide{}.xml", i + 1));
+    }
+    // Kept parts keep their names; generated parts stay clear of them.
+    for k in p.kept_parts.iter().take(opc::MAX_ENTRIES) {
+        let key = opc::norm(&k.name);
+        if k.data.is_empty() || k.name.is_empty() || x.kept_names.contains_key(&key) || opc::regenerated(&k.name) || key.ends_with(".rels") {
+            log::warn!("pptx: kept part {} is not written (the export writes that part itself)", k.name);
+            continue;
+        }
+        x.kept_names.insert(key, k.name.clone());
+        x.pkg.reserve(&k.name);
     }
     let mut pres = Out::new("ppt/presentation.xml");
 
@@ -412,6 +492,9 @@ pub fn export(p: &Presentation) -> Result<Vec<u8>, PptxError> {
             lrids.push(rid);
             let mut lo = Out::new(&lname);
             lo.rels.add("slideMaster", &opc::relative(&lname, &mname), false);
+            for r in &l.kept_rels {
+                x.kept_rel(&mut lo, r);
+            }
             let xml = layout_xml(&mut x, &mut lo, l);
             x.pkg.xml_part(&lname, CT_LAYOUT, xml);
             x.pkg.rels(&lname, &lo.rels);
@@ -427,6 +510,9 @@ pub fn export(p: &Presentation) -> Result<Vec<u8>, PptxError> {
         for rid in lrids {
             layout_ids.push((big_id, rid));
             big_id += 1;
+        }
+        for r in &m.kept_rels {
+            x.kept_rel(&mut mo, r);
         }
         let xml = master_xml(&mut x, &mut mo, m, &layout_ids);
         x.pkg.xml_part(&mname, CT_MASTER, xml);
@@ -487,6 +573,9 @@ pub fn export(p: &Presentation) -> Result<Vec<u8>, PptxError> {
             so.rels.add("comments", &opc::relative(&sname, &cname), false);
             x.pkg.xml_part(&cname, CT_COMMENTS, comments_xml(&s.comments, &mut authors));
         }
+        for r in &s.kept_rels {
+            x.kept_rel(&mut so, r);
+        }
         let xml = slide_xml(&mut x, &mut so, s);
         x.pkg.xml_part(&sname, CT_SLIDE, xml);
         x.pkg.rels(&sname, &so.rels);
@@ -514,6 +603,9 @@ pub fn export(p: &Presentation) -> Result<Vec<u8>, PptxError> {
     x.pkg.xml_part("ppt/viewProps.xml", CT_VIEW_PROPS, view_props_xml());
     let ts = crate::tables::table_styles_xml(&x.table_styles, &p.table_styles);
     x.pkg.xml_part("ppt/tableStyles.xml", CT_TABLE_STYLES, ts);
+    for r in &p.kept_rels {
+        x.kept_rel(&mut pres, r);
+    }
     let pxml = presentation_xml(&mut x, &mut pres, &master_rids, notes_master_rid.as_deref(), &slide_rids);
     x.pkg.xml_part("ppt/presentation.xml", CT_PRES, pxml);
     x.pkg.rels("ppt/presentation.xml", &pres.rels);
@@ -525,7 +617,21 @@ pub fn export(p: &Presentation) -> Result<Vec<u8>, PptxError> {
     root.add("officeDocument", "ppt/presentation.xml", false);
     root.add(opc::RT_CORE, "docProps/core.xml", false);
     root.add("extended-properties", "docProps/app.xml", false);
+    for r in &p.kept_package_rels {
+        if let Some(part) = x.kept_target(&r.target) {
+            root.add(&r.kind, &part, false);
+        }
+    }
     x.pkg.rels("", &root);
+
+    // Parts kept from the opened file, as they were, with their relationships.
+    for k in &p.kept_parts {
+        let Some(name) = x.kept_names.get(&opc::norm(&k.name)).cloned() else { continue };
+        let mut ko = Out::new(&name);
+        x.kept_part_rels(&mut ko, &k.rels);
+        x.pkg.kept(&name, &k.content_type, k.data.as_ref().clone());
+        x.pkg.rels(&name, &ko.rels);
+    }
     x.pkg.finish()
 }
 

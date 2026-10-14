@@ -367,9 +367,11 @@ fn frame(imp: &mut Imp, part: &Part, ctx: &mut IdCtx, e: &El, depth: usize) -> S
         }
         if let Some(c) = gd.child("chart")
             && let Some(rel) = part.rels.get(c.attr("r:id").unwrap_or(""))
-            && let Some(bytes) = imp.pkg.get(&rel.target)
-            && let Some(chart) = super::read_chart_xml(bytes)
+            && let Some(bytes) = imp.pkg.peek(&rel.target)
+            && let Some(mut chart) = super::read_chart_xml(bytes)
         {
+            imp.pkg.consume(&rel.target);
+            chart.kept_rels = super::kept_rels(&imp.pkg.rels(&rel.target));
             s.kind = ShapeKind::Chart(Box::new(chart));
             return s;
         }
@@ -395,7 +397,8 @@ fn frame(imp: &mut Imp, part: &Part, ctx: &mut IdCtx, e: &El, depth: usize) -> S
     } else {
         uri.rsplit('/').next().unwrap_or("Object").to_string()
     };
-    s.kind = ShapeKind::Opaque { xml: part.keep(e), preview, label };
+    let rels = super::referenced_rels(e, &part.rels);
+    s.kind = ShapeKind::Opaque { xml: part.keep(e), preview, label, rels };
     s
 }
 
@@ -403,7 +406,7 @@ fn frame(imp: &mut Imp, part: &Part, ctx: &mut IdCtx, e: &El, depth: usize) -> S
 /// `v:imagedata` of the legacy VML drawing shape with that id, as PowerPoint 2007 wrote them.
 fn vml_preview(imp: &mut Imp, part: &Part, spid: &str) -> Option<deckcraft_model::MediaId> {
     for rel in part.rels.items.iter().filter(|r| r.kind == "vmlDrawing" && !r.external) {
-        let Some(doc) = imp.pkg.xml(&rel.target) else { continue };
+        let Some(doc) = imp.pkg.peek_xml(&rel.target) else { continue };
         let mut shapes = vec![];
         doc.root.find_all("shape", &mut shapes);
         let Some(img) = shapes.into_iter().find(|s| s.attr("id") == Some(spid)).and_then(|s| s.find("imagedata")) else { continue };
@@ -418,9 +421,9 @@ fn vml_preview(imp: &mut Imp, part: &Part, spid: &str) -> Option<deckcraft_model
 fn smartart(imp: &mut Imp, part: &Part, gd: &El, frame: &Shape, depth: usize) -> Option<Shape> {
     let rel_ids = gd.child("relIds")?;
     let dm = part.rels.get(rel_ids.attr("r:dm").unwrap_or(""))?;
-    let data = imp.pkg.xml(&dm.target)?;
+    let data = imp.pkg.peek_xml(&dm.target)?;
     let drawing_rel = data.root.find("dataModelExt").and_then(|x| x.attr("relId")).and_then(|id| part.rels.get(id)).map(|r| r.target.clone())?;
-    let mut d = imp.pkg.xml(&drawing_rel)?;
+    let mut d = imp.pkg.peek_xml(&drawing_rel)?;
     super::resolve_mc(&mut d.root, 0);
     let dpart = Part::new(imp.pkg, &drawing_rel, &d);
     let tree = d.root.child("spTree")?;
@@ -428,6 +431,14 @@ fn smartart(imp: &mut Imp, part: &Part, gd: &El, frame: &Shape, depth: usize) ->
     let children = sp_tree(imp, &dpart, &mut sub, tree, depth + 1);
     if children.is_empty() {
         return None;
+    }
+    // The diagram is now a group of its drawn shapes: its parts are consumed.
+    imp.pkg.consume(&dm.target);
+    imp.pkg.consume(&drawing_rel);
+    for key in ["r:lo", "r:qs", "r:cs"] {
+        if let Some(r) = part.rels.get(rel_ids.attr(key).unwrap_or("")) {
+            imp.pkg.consume(&r.target);
+        }
     }
     let mut g = frame.clone();
     let x = frame.xfrm.unwrap_or_default();

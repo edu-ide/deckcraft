@@ -245,6 +245,7 @@ pub fn build_master(size: Size, theme: Theme, first_id: u32) -> (Master, u32) {
             preserve: true,
             color_map: None,
             raw_ext: None,
+            kept_rels: vec![],
         });
     };
 
@@ -476,6 +477,7 @@ pub fn build_master(size: Size, theme: Theme, first_id: u32) -> (Master, u32) {
         color_map: vec![],
         preserve: false,
         raw_ext: None,
+        kept_rels: vec![],
     };
     (master, b.next + 1)
 }
@@ -514,6 +516,9 @@ pub fn blank_presentation(size: Size, theme: Theme, title_slide: bool) -> Presen
         embedded_fonts: vec![],
         table_styles: vec![],
         raw_ext: None,
+        kept_parts: vec![],
+        kept_package_rels: vec![],
+        kept_rels: vec![],
     };
     if title_slide {
         let s = new_slide(&mut p, first_layout);

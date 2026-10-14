@@ -396,7 +396,7 @@ pub fn shape(w: &mut W, x: &mut Exp, o: &mut Out, cx: &mut Ctx, s: &Shape, depth
             }
             w.close("p:grpSp");
         }
-        ShapeKind::Opaque { xml, preview, label } => opaque(w, x, o, cx, s, xml, *preview, label),
+        ShapeKind::Opaque { xml, preview, label, rels } => opaque(w, x, o, cx, s, xml, *preview, label, rels),
     }
 }
 
@@ -631,17 +631,35 @@ fn media(w: &mut W, x: &mut Exp, o: &mut Out, id: u32, s: &Shape, m: &deckcraft_
 }
 
 #[allow(clippy::too_many_arguments)]
-fn opaque(w: &mut W, x: &mut Exp, o: &mut Out, cx: &mut Ctx, s: &Shape, xml: &str, preview: Option<deckcraft_model::MediaId>, label: &str) {
-    // Kept XML that references no relationships can be written back as it was.
+fn opaque(
+    w: &mut W,
+    x: &mut Exp,
+    o: &mut Out,
+    cx: &mut Ctx,
+    s: &Shape,
+    xml: &str,
+    preview: Option<deckcraft_model::MediaId>,
+    label: &str,
+    rels: &[deckcraft_model::KeptRel],
+) {
+    // Kept XML is written back as it was, its relationship references pointing at the parts
+    // this export writes (kept parts, media, slides) under the ids they get here.
     if let Ok(doc) = crate::xml::parse(xml.as_bytes())
-        && !crate::read::has_rel_refs(&doc.root)
         && matches!(doc.root.local(), "graphicFrame" | "sp" | "grpSp" | "cxnSp")
     {
+        let mut map = std::collections::HashMap::new();
+        for r in rels.iter().take(1000) {
+            if let Some(id) = x.kept_rel(o, r) {
+                map.insert(r.id.clone(), id);
+            }
+        }
         let mut root = doc.root;
-        let id = cx.id_for(s);
-        set_cnvpr_id(&mut root, id);
-        w.raw(&root.to_xml());
-        return;
+        if super::remap_rel_refs(&mut root, &map) {
+            let id = cx.id_for(s);
+            set_cnvpr_id(&mut root, id);
+            w.raw(&root.to_xml());
+            return;
+        }
     }
     log::warn!("pptx: object '{label}' written as its preview picture");
     let id = cx.id_for(s);

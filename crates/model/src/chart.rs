@@ -189,6 +189,9 @@ pub struct Chart {
     /// Original chart XML part kept for round-trip of unmodelled options.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw: Option<String>,
+    /// Relationships of the chart part to kept parts (the embedded workbook, user shapes).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kept_rels: Vec<crate::KeptRel>,
 }
 
 impl Default for Chart {
@@ -226,6 +229,7 @@ impl Default for Chart {
             y2_hidden: false,
             lang: None,
             raw: None,
+            kept_rels: vec![],
         }
     }
 }

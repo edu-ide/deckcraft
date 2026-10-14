@@ -1,6 +1,7 @@
 //! Open Packaging Conventions: the zip container, part names, relationships and content types.
 
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Read, Write};
 
 use crate::PptxError;
@@ -30,8 +31,13 @@ pub const RT_MEDIA: &str = "http://schemas.microsoft.com/office/2007/relationshi
 pub const RT_CORE: &str = "http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties";
 
 /// The files of a package, keyed by normalised part name (no leading slash, lowercase).
+///
+/// Reading a part through [`Package::get`] or [`Package::xml`] marks it as consumed by the
+/// model; [`Package::peek`] and [`Package::peek_xml`] look without consuming. Whatever is left
+/// unconsumed after an import is kept byte-for-byte (`Presentation::kept_parts`).
 pub struct Package {
     parts: HashMap<String, (String, Vec<u8>)>,
+    used: RefCell<HashSet<String>>,
 }
 
 impl Package {
@@ -75,43 +81,57 @@ impl Package {
             total = total.saturating_add(data.len() as u64);
             parts.insert(name.to_ascii_lowercase(), (name, data));
         }
-        Ok(Package { parts })
+        Ok(Package { parts, used: RefCell::new(HashSet::new()) })
     }
+    /// The bytes of a part, marking it consumed.
     pub fn get(&self, name: &str) -> Option<&[u8]> {
+        let key = norm(name);
+        let d = self.parts.get(&key).map(|(_, d)| d.as_slice())?;
+        self.used.borrow_mut().insert(key);
+        Some(d)
+    }
+    /// The bytes of a part without marking it consumed (a probe that may not model the part).
+    pub fn peek(&self, name: &str) -> Option<&[u8]> {
         self.parts.get(&norm(name)).map(|(_, d)| d.as_slice())
+    }
+    /// Mark a part consumed (after a probe modelled it).
+    pub fn consume(&self, name: &str) {
+        self.used.borrow_mut().insert(norm(name));
+    }
+    pub fn is_consumed(&self, name: &str) -> bool {
+        self.used.borrow().contains(&norm(name))
+    }
+    /// Every part as the file spelled it, with its bytes.
+    pub fn parts(&self) -> impl Iterator<Item = (&str, &[u8])> {
+        self.parts.values().map(|(n, d)| (n.as_str(), d.as_slice()))
+    }
+    /// Parse an XML part without marking it consumed.
+    pub fn peek_xml(&self, name: &str) -> Option<xml::Doc> {
+        let b = self.peek(name)?;
+        parse_part(name, b)
     }
     /// Parse an XML part.
     pub fn xml(&self, name: &str) -> Option<xml::Doc> {
         let b = self.get(name)?;
-        if b.len() > MAX_XML_PART {
-            log::warn!("pptx: XML part {name} too large");
-            return None;
-        }
-        match xml::parse(b) {
-            Ok(d) => Some(d),
-            Err(e) => {
-                log::warn!("pptx: {name}: {e}");
-                None
-            }
-        }
+        parse_part(name, b)
     }
     /// Relationships of a part (`ppt/slides/slide1.xml` → `ppt/slides/_rels/slide1.xml.rels`).
     pub fn rels(&self, part: &str) -> Rels {
         let rp = rels_path(part);
-        let Some(doc) = self.xml(&rp) else { return Rels::default() };
+        let Some(doc) = self.peek_xml(&rp) else { return Rels::default() };
         let base = dir_of(part);
         let mut out = Rels::default();
         for r in doc.root.children_named("Relationship") {
             let (Some(id), Some(ty), Some(target)) = (r.attr("Id"), r.attr("Type"), r.attr("Target")) else { continue };
             let external = r.attr("TargetMode").is_some_and(|m| m.eq_ignore_ascii_case("external"));
             let target = if external { target.to_string() } else { resolve(&base, target) };
-            out.items.push(Rel { id: id.to_string(), kind: ty.rsplit('/').next().unwrap_or(ty).to_string(), target, external });
+            out.items.push(Rel { id: id.to_string(), kind: ty.rsplit('/').next().unwrap_or(ty).to_string(), ty: ty.to_string(), target, external });
         }
         out
     }
     /// Content types: (extension defaults, part overrides).
     pub fn content_type(&self, part: &str) -> Option<String> {
-        let doc = self.xml("[Content_Types].xml")?;
+        let doc = self.peek_xml("[Content_Types].xml")?;
         let p = format!("/{}", norm(part));
         for o in doc.root.children_named("Override") {
             if o.attr("PartName").is_some_and(|n| n.to_ascii_lowercase() == p) {
@@ -129,11 +149,27 @@ impl Package {
     }
 }
 
+fn parse_part(name: &str, b: &[u8]) -> Option<xml::Doc> {
+    if b.len() > MAX_XML_PART {
+        log::warn!("pptx: XML part {name} too large");
+        return None;
+    }
+    match xml::parse(b) {
+        Ok(d) => Some(d),
+        Err(e) => {
+            log::warn!("pptx: {name}: {e}");
+            None
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Rel {
     pub id: String,
     /// Last segment of the relationship type (`slide`, `image`, `media`…).
     pub kind: String,
+    /// The full relationship type URI.
+    pub ty: String,
     /// Absolute part name for internal targets; the URL for external ones.
     pub target: String,
     pub external: bool,
@@ -237,6 +273,34 @@ pub fn relative(from: &str, to: &str) -> String {
     out
 }
 
+/// Does the export write a part of this name itself (slides, layouts, themes, view
+/// properties…)? Such parts are never kept: the writer regenerates them.
+pub fn regenerated(name: &str) -> bool {
+    let n = norm(name);
+    let numbered = |dir: &str, stem: &str, ext: &str| {
+        n.strip_prefix(dir)
+            .and_then(|r| r.strip_prefix(stem))
+            .and_then(|r| r.strip_suffix(ext))
+            .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+    };
+    matches!(
+        n.as_str(),
+        "ppt/presentation.xml"
+            | "ppt/presprops.xml"
+            | "ppt/viewprops.xml"
+            | "ppt/tablestyles.xml"
+            | "ppt/commentauthors.xml"
+            | "docprops/core.xml"
+            | "docprops/app.xml"
+            | "ppt/notesmasters/notesmaster1.xml"
+    ) || numbered("ppt/slides/", "slide", ".xml")
+        || numbered("ppt/slidelayouts/", "slidelayout", ".xml")
+        || numbered("ppt/slidemasters/", "slidemaster", ".xml")
+        || numbered("ppt/theme/", "theme", ".xml")
+        || numbered("ppt/notesslides/", "notesslide", ".xml")
+        || numbered("ppt/comments/", "comment", ".xml")
+}
+
 // ---------------------------------------------------------------------------------------------
 // Writing
 
@@ -256,6 +320,13 @@ impl RelsOut {
         let id = format!("rId{}", self.items.len() + 1);
         self.items.push((id.clone(), ty, target.to_string(), external));
         id
+    }
+    /// Add a relationship under exactly this id (a kept part's content refers to it).
+    pub fn push(&mut self, id: &str, ty: &str, target: &str, external: bool) {
+        if self.items.iter().any(|(i, ..)| i == id) {
+            return;
+        }
+        self.items.push((id.to_string(), ty.to_string(), target.to_string(), external));
     }
     /// Always add a new relationship even if an identical one exists.
     pub fn add_new(&mut self, kind: &str, target: &str, external: bool) -> String {
@@ -284,12 +355,15 @@ pub struct PackageOut {
     files: Vec<(String, Vec<u8>, bool)>,
     defaults: Vec<(String, String)>,
     overrides: Vec<(String, String)>,
+    /// Names kept parts will take; generated names avoid them.
+    reserved: Vec<String>,
 }
 
 impl Default for PackageOut {
     fn default() -> Self {
         PackageOut {
             files: vec![],
+            reserved: vec![],
             defaults: vec![
                 ("rels".into(), "application/vnd.openxmlformats-package.relationships+xml".into()),
                 ("xml".into(), "application/xml".into()),
@@ -300,6 +374,31 @@ impl Default for PackageOut {
 }
 
 impl PackageOut {
+    /// Is a part of this name (case-insensitively) already in, or reserved for, the package?
+    pub fn taken(&self, name: &str) -> bool {
+        self.files.iter().any(|(n, ..)| n.eq_ignore_ascii_case(name))
+            || self.reserved.iter().any(|n| n.eq_ignore_ascii_case(name))
+            || name.eq_ignore_ascii_case("[Content_Types].xml")
+    }
+    /// Reserve a name for a kept part written later.
+    pub fn reserve(&mut self, name: &str) {
+        self.reserved.push(name.to_string());
+    }
+    /// Add a part kept from an opened file under its original name: an override content type
+    /// unless the extension's default already says so; deflated unless it is media.
+    pub fn kept(&mut self, name: &str, content_type: &str, data: Vec<u8>) {
+        let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+        let by_default = self.defaults.iter().any(|(e, c)| *e == ext && c == content_type);
+        if !by_default {
+            if ext.is_empty() || self.defaults.iter().any(|(e, _)| *e == ext) || ext == "xml" {
+                self.overrides.push((format!("/{name}"), content_type.to_string()));
+            } else {
+                self.defaults.push((ext, content_type.to_string()));
+            }
+        }
+        let compress = !(content_type.starts_with("image/") || content_type.starts_with("video/") || content_type.starts_with("audio/"));
+        self.files.push((name.to_string(), data, compress));
+    }
     /// Add an XML part with its content type override.
     pub fn xml_part(&mut self, name: &str, content_type: &str, data: Vec<u8>) {
         self.overrides.push((format!("/{name}"), content_type.to_string()));

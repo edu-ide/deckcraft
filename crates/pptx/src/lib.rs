@@ -1,9 +1,11 @@
 //! PPTX import and export: Office Open XML PresentationML / DrawingML, written from the public
 //! ECMA-376 standard.
 //!
-//! [`import`] reads a package leniently (unknown parts are skipped, malformed parts are logged and
-//! ignored, every size and depth is bounded) into the DeckCraft model; [`export`] writes a valid
-//! package that PowerPoint opens without repair.
+//! [`import`] reads a package leniently (malformed parts are logged and ignored, every size and
+//! depth is bounded) into the DeckCraft model. Parts the model does not interpret (embedded
+//! objects and workbooks, printer settings, thumbnails…) are kept byte-for-byte with the
+//! relationships that point at them, so [`export`] writes a valid package that PowerPoint opens
+//! without repair and that still holds everything the opened file held.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
