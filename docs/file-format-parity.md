@@ -1,6 +1,6 @@
 # File-format parity with PowerPoint
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-12 · **Change:** trivial (Groups with a small legacy child coordinate space draw outlines, dashes, arrowheads and ink at their own width (#233); previously major: created; formats taken from PowerPoint 16.113.4's Info.plist, PPTX coverage measured from `crates/pptx`) · **Target:** Microsoft PowerPoint for Mac 16.113 (Microsoft 365)
+> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-15 · **Change:** minor (saving keeps every unread package part: printer settings, embedded workbooks and OLE objects, thumbnails, with their relationships and content types; previously trivial: Groups with a small legacy child coordinate space draw outlines, dashes, arrowheads and ink at their own width (#233); previously major: created; formats taken from PowerPoint 16.113.4's Info.plist, PPTX coverage measured from `crates/pptx`) · **Target:** Microsoft PowerPoint for Mac 16.113 (Microsoft 365)
 
 Every format PowerPoint reads or writes, DeckCraft's support, fidelity and how it is tested.
 Gaps are itemized in [gaps.md](gaps.md#file-formats). Dimension score: **~58% ready**
@@ -46,14 +46,18 @@ PowerPoint opens and saves; Viewer = opens only).
 | Video: VP9, AV1 in WebM/MKV | partly (OS codecs) | yes | Ahead of PowerPoint for Mac |
 | WMV | yes (Windows) | embedded, not playable | |
 | Online video (YouTube embeds) | yes | no | Cloud feature |
-| Embedded OLE objects | yes | kept on round trip (opaque), not insertable or editable | `ShapeKind::Opaque` |
+| Embedded OLE objects | yes | kept on round trip with their object parts and previews, not insertable or editable | `ShapeKind::Opaque` + `Presentation::kept_parts`; `crates/pptx/tests/kept_parts.rs` |
 | 3-D models (`.glb`) | yes | no | |
 | Embedded fonts | yes | no | `p:embeddedFontLst` ignored |
 
 ## PPTX coverage (PresentationML / DrawingML)
 
 What `crates/pptx` reads and writes, from ECMA-376. "Kept" means the XML is preserved untouched for
-the round trip even though DeckCraft doesn't model it.
+the round trip even though DeckCraft doesn't model it. Whole parts the model does not read
+(printer settings, embedded workbooks and OLE objects, thumbnails, orphan parts) are kept
+byte-for-byte with the relationships pointing at them (`Presentation::kept_parts`); on a 20-deck
+corpus of python-pptx-made files no part is lost on save (2026-10-15, `kept_parts.rs`
+`corpus_round_trips_lose_no_part` with `DECKCRAFT_PPTX_CORPUS`).
 
 | Part / feature | Read | Write | Notes |
 |---|---|---|---|
@@ -99,6 +103,7 @@ the round trip even though DeckCraft doesn't model it.
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-15 | minor | Every unread package part is kept on save with its relationships and content type; opaque shapes keep their relationship references (#858) |
 | 2026-10-12 | minor | EMF/WMF text and pattern brushes drawn; OLE (VML) and ActiveX previews read |
 | 2026-10-12 | minor | Text warps rendered; their adjust values read and written |
 | 2026-10-12 | trivial | Groups with a small legacy child coordinate space draw outlines, dashes, arrowheads and ink at their own width (#233) |
