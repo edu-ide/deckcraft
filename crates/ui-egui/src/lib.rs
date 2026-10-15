@@ -227,6 +227,9 @@ pub struct SlideApp {
     pub(crate) thumb_drag: Option<(usize, usize)>,
     /// Selection pane: folded groups, renaming, drag and drop.
     pub selpane: selpane::State,
+    /// Documents (by uid) opened from PowerPoint bytes with no path (web): Save hands them back
+    /// as `.pptx`, the format they came in, not as a `.deckcraft` copy.
+    pptx_bytes_docs: std::collections::HashSet<u64>,
 }
 
 impl SlideApp {
@@ -267,6 +270,7 @@ impl SlideApp {
             ui_fonts: uifonts::UiFonts::default(),
             thumb_drag: None,
             selpane: selpane::State::default(),
+            pptx_bytes_docs: Default::default(),
         }
     }
 
@@ -539,7 +543,7 @@ impl SlideApp {
             "app.insertPictureDialog" => self.pick_and_insert("picture", "insert.picture"),
             "app.insertAudioDialog" => self.pick_and_insert("audio", "insert.audio"),
             "app.insertVideoDialog" => self.pick_and_insert("video", "insert.video"),
-            "app.saveAsDialog" => self.save_as_dialog("deckcraft"),
+            "app.saveAsDialog" => self.save_as_dialog(self.save_format()),
             "app.exportDialog" => self.dialog = Some(dialogs::Dialog::new("export")),
             "app.dialog" => {
                 let d = p.get("id").and_then(Value::as_str).ok_or("missing `id`")?;
@@ -645,8 +649,14 @@ impl SlideApp {
                 Err(e) => self.set_status(e.to_string()),
             }
         } else {
-            self.save_as_dialog("deckcraft");
+            self.save_as_dialog(self.save_format());
         }
+    }
+
+    /// The format Save uses for the active presentation when it has no file: PowerPoint for one
+    /// opened from PowerPoint bytes (web), DeckCraft's own otherwise.
+    fn save_format(&self) -> &'static str {
+        if self.session.active().is_some_and(|d| d.path.is_none() && self.pptx_bytes_docs.contains(&d.uid)) { "pptx" } else { "deckcraft" }
     }
 
     /// Act on requests commands left for the UI.
@@ -663,7 +673,7 @@ impl SlideApp {
                 UiRequest::Message { text } => self.set_status(text),
                 UiRequest::PickFile { purpose } => {
                     if purpose == "saveAs" {
-                        self.save_as_dialog("deckcraft");
+                        self.save_as_dialog(self.save_format());
                     }
                 }
                 UiRequest::Media { action, shape, ms } => {
@@ -712,8 +722,14 @@ impl SlideApp {
         if self.session.active().is_none() && cmd != "file.openBytes" {
             let _ = self.session.execute("file.new", &json!({}));
         }
-        if let Err(e) = self.session.execute(cmd, &p) {
-            self.set_status(e.to_string());
+        match self.session.execute(cmd, &p) {
+            Ok(_) if cmd == "file.openBytes" && deckcraft_engine::cmd::file::format_for_path(&lower) == "pptx" => {
+                if let Some(d) = self.session.active() {
+                    self.pptx_bytes_docs.insert(d.uid);
+                }
+            }
+            Ok(_) => {}
+            Err(e) => self.set_status(e.to_string()),
         }
     }
 
