@@ -476,7 +476,30 @@ fn collect_kept(imp: &Imp, p: &mut Presentation) {
         })
         .collect();
     kept.sort_by(|a, b| a.name.cmp(&b.name));
-    let names: HashMap<String, String> = kept.iter().map(|k| (opc::norm(&k.name), k.name.clone())).collect();
+    // A kept part whose own relationships cannot all be restored (a handout master whose theme
+    // the export regenerates…) is not kept: a part with dangling references makes PowerPoint
+    // repair the file, which is worse than the part missing. Dropping one can orphan another.
+    let mut names: HashMap<String, String> = kept.iter().map(|k| (opc::norm(&k.name), k.name.clone())).collect();
+    loop {
+        let before = kept.len();
+        kept.retain(|k| {
+            let ok = k.rels.iter().all(|r| match &r.target {
+                KeptTarget::Part { name } => {
+                    let key = opc::norm(name);
+                    imp.media_by_part.contains_key(&key) || imp.slide_by_part.contains_key(&key) || names.contains_key(&key)
+                }
+                _ => true,
+            });
+            if !ok {
+                log::warn!("pptx: part {} is not kept: a part it refers to is not written back", k.name);
+            }
+            ok
+        });
+        if kept.len() == before {
+            break;
+        }
+        names = kept.iter().map(|k| (opc::norm(&k.name), k.name.clone())).collect();
+    }
     let resolve = |r: &mut KeptRel| -> bool {
         let KeptTarget::Part { name } = &r.target else { return true };
         let key = opc::norm(name);

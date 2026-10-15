@@ -161,7 +161,9 @@ Detail in [animation-parity.md](animation-parity.md). 10–16 h; the pane is a *
 
 ### Notes and Handout masters
 - **Evidence:** checklist row missing; PPTX writes a notes master but there's no view to edit it,
-  and no handout master at all.
+  and no handout master at all. An opened file's handout master is not kept on save either: its
+  theme part would clash with the regenerated `ppt/theme/themeN.xml` names, and a kept part with
+  a dangling relationship is dropped whole (`crates/pptx/src/read/mod.rs`, `collect_kept`).
 - **Estimate:** 4–6 h.
 
 ### Edit points, text warp, 3-D

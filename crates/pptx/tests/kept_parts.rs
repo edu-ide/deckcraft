@@ -74,6 +74,17 @@ fn deck() -> Vec<u8> {
             ("ppt/embeddings/oleObject1.bin", vec![0xD0, 0xCF, 0x11, 0xE0, 9, 9]),
             ("ppt/media/preview.png", png()),
             ("ppt/diagrams/data1.xml", br#"<dgm:dataModel xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram"/>"#.to_vec()),
+            // A handout master with its own theme: the export regenerates theme parts, so the
+            // master's theme relationship cannot be restored and the master is left out whole.
+            (
+                "ppt/handoutMasters/handoutMaster1.xml",
+                br#"<p:handoutMaster xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:cSld><p:spTree/></p:cSld></p:handoutMaster>"#.to_vec(),
+            ),
+            (
+                "ppt/handoutMasters/_rels/handoutMaster1.xml.rels",
+                format!(r#"<Relationships xmlns="{RELS_NS}"><Relationship Id="rId1" Type="{RT}/theme" Target="../theme/theme2.xml"/></Relationships>"#).into_bytes(),
+            ),
+            ("ppt/theme/theme2.xml", br#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" name="Handout"/>"#.to_vec()),
         ],
         |name, s| {
             match name {
@@ -89,7 +100,9 @@ fn deck() -> Vec<u8> {
             ),
             "ppt/_rels/presentation.xml.rels" => s.replacen(
                 "</Relationships>",
-                &format!(r#"<Relationship Id="rIdPrn" Type="{RT}/printerSettings" Target="printerSettings/printerSettings1.bin"/></Relationships>"#),
+                &format!(
+                    r#"<Relationship Id="rIdPrn" Type="{RT}/printerSettings" Target="printerSettings/printerSettings1.bin"/><Relationship Id="rIdHo" Type="{RT}/handoutMaster" Target="handoutMasters/handoutMaster1.xml"/></Relationships>"#
+                ),
                 1,
             ),
             "ppt/slides/slide1.xml" => s.replacen("</p:spTree>", &format!("{frames}</p:spTree>"), 1),
@@ -114,6 +127,10 @@ fn content_type(ct: &str, part_name: &str) -> String {
     let ext = part_name.rsplit('.').next().expect("extension");
     let i = ct.find(&format!(r#"Extension="{ext}""#)).unwrap_or_else(|| panic!("no content type for {part_name}: {ct}"));
     attr(&ct[i..], "Extension", "ContentType").to_string()
+}
+
+fn pres_rels_has_handout(out: &[u8]) -> bool {
+    part(out, "ppt/_rels/presentation.xml.rels").contains("handoutMaster")
 }
 
 fn rel_target(rels: &str, id: &str) -> String {
@@ -147,7 +164,7 @@ fn unmodelled_parts_come_back_with_their_relationships() {
         ]
         .into_iter()
         .collect(),
-        "everything the model did not consume, orphans included; the chart and the preview picture are modelled"
+        "everything the model did not consume, orphans included; the chart and the preview picture are modelled, the handout master cannot be written whole"
     );
     assert_eq!(
         p.kept_parts.iter().find(|k| k.name.ends_with("oleObject1.bin")).map(|k| k.content_type.as_str()),
@@ -170,9 +187,13 @@ fn unmodelled_parts_come_back_with_their_relationships() {
 
     let out = deckcraft_pptx::export(&p).expect("export");
     let (a, b) = (names(&src), names(&out));
-    // Media items are the model's own and get the export's names; everything else keeps its name.
-    let lost: Vec<_> = a.difference(&b).filter(|n| !n.starts_with("ppt/media/")).collect();
+    // Media items are the model's own and get the export's names; the handout master and its
+    // theme are left out (see `deck`); everything else keeps its name.
+    let lost: Vec<_> =
+        a.difference(&b).filter(|n| !n.starts_with("ppt/media/") && !n.contains("handoutMaster") && !n.ends_with("theme2.xml")).collect();
     assert!(lost.is_empty(), "parts lost in the round trip: {lost:?}");
+    assert!(!b.iter().any(|n| n.contains("handoutMaster")), "a part with a dangling relationship is not written");
+    assert!(!pres_rels_has_handout(&out), "nor is the relationship to it");
     assert_eq!(b.iter().filter(|n| n.starts_with("ppt/media/")).count(), 1, "one copy of the preview picture");
 
     // Relationships point at the kept parts again.
@@ -207,8 +228,10 @@ fn unmodelled_parts_come_back_with_their_relationships() {
     assert_eq!(names(&again), b);
 }
 
+/// An edited chart is written from the model: the relationship to its original workbook goes
+/// (the data differ now); the workbook bytes stay in the package as an orphan part.
 #[test]
-fn an_edited_chart_leaves_its_stale_workbook_out() {
+fn an_edited_chart_drops_the_relationship_to_its_stale_workbook() {
     let mut p = deckcraft_pptx::import(&deck()).expect("import");
     let slide = std::sync::Arc::make_mut(&mut p.slides[0]);
     for s in &mut slide.shapes {
